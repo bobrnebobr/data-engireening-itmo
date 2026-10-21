@@ -1,0 +1,128 @@
+name: rustfs-lab
+
+x-app: &app
+  build: .
+  image: rustfs-analytics-lab3:local
+  init: true
+  environment:
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    CELERY_VISIBILITY_TIMEOUT: ${CELERY_VISIBILITY_TIMEOUT:-120}
+    S3_ENDPOINT: http://rustfs:9000
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:-admin}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:-admin}
+    S3_REGION: ${S3_REGION:-us-east-1}
+    S3_BUCKET: ${S3_BUCKET:-hh-lake}
+    S3_INPUT_KEY: ${S3_INPUT_KEY:-it_vacancies_2024.csv}
+    S3_OUTPUT_PREFIX: ${S3_OUTPUT_PREFIX:-results/}
+    S3_INTERMEDIATE_PREFIX: ${S3_INTERMEDIATE_PREFIX:-intermediate/}
+    CHUNK_SIZE: ${CHUNK_SIZE:-1000}
+    MAX_IN_FLIGHT: ${MAX_IN_FLIGHT:-2}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    POLARS_MAX_THREADS: "1"
+  depends_on:
+    redis:
+      condition: service_healthy
+
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-admin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-admin}
+      RUSTFS_VOLUMES: "/data/disk{1...4}"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - type: bind
+        source: /mnt/disk1/rustfs
+        target: /data/disk1
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/disk2/rustfs
+        target: /data/disk2
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/disk3/rustfs
+        target: /data/disk3
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/disk4/rustfs
+        target: /data/disk4
+        bind:
+          create_host_path: false
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mapper-1:
+    <<: *app
+    command:
+      - celery
+      - -A
+      - app.celery_app:celery_app
+      - worker
+      - --queues=map
+      - --concurrency=1
+      - --prefetch-multiplier=1
+      - --hostname=mapper-1@%h
+      - --loglevel=INFO
+
+  mapper-2:
+    <<: *app
+    command:
+      - celery
+      - -A
+      - app.celery_app:celery_app
+      - worker
+      - --queues=map
+      - --concurrency=1
+      - --prefetch-multiplier=1
+      - --hostname=mapper-2@%h
+      - --loglevel=INFO
+
+  reducer:
+    <<: *app
+    command:
+      - celery
+      - -A
+      - app.celery_app:celery_app
+      - worker
+      - --queues=reduce
+      - --concurrency=1
+      - --prefetch-multiplier=1
+      - --hostname=reducer@%h
+      - --loglevel=INFO
+
+  orchestrator:
+    <<: *app
+    profiles: ["job"]
+    command: ["python", "-m", "app.main"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+      mapper-1:
+        condition: service_started
+      mapper-2:
+        condition: service_started
+      reducer:
+        condition: service_started
+
+volumes:
+  redis-data:
